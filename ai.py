@@ -447,7 +447,6 @@ def generate_feedback(enriched_data: dict) -> FeedbackList:
     """
     # Initialize OpenAI client
     client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
         api_key=os.environ.get("OPENROUTER_API_KEY"),
     )
     
@@ -456,6 +455,7 @@ def generate_feedback(enriched_data: dict) -> FeedbackList:
     content = content_mock
     
     # Call the AI to generate feedback
+    print("Calling OpenAI API...")
     response = client.responses.parse(
         model="gpt-5",
         input=[

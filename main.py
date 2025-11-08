@@ -256,13 +256,14 @@ async def generate_ai_feedback(request: Request):
         }
     }
     """
+    print("Generating AI feedback...")
     try:
         # Parse the request body
         data = await request.json()
         
         # Generate feedback using the AI function
         feedback = generate_feedback(data)
-        
+        print("Returning feedback...", feedback)
         return feedback
         
     except Exception as e:
