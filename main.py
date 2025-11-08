@@ -1,265 +1,224 @@
-import os
-import uuid
+import uvicorn
 import shutil
-import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import uuid
+import os
+import json
+import modal # Import Modal
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-
-from dotenv import load_dotenv
+from pydantic import BaseModel
 import boto3
-
-# Optional deps
-try:
-    import modal  # optional; may not exist in Railway image
-except Exception:
-    modal = None
-
-# Your local modules
+from dotenv import load_dotenv
 from STT import transcribe_video
 from prosody_processor import analyze_prosody
+# Import the new enricher
 from enricher import enrich_transcript
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ----------------------------------
-# Environment & AWS
-# ----------------------------------
+# Load environment variables from .env file
 load_dotenv()
 
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-
-def get_s3_client():
-    if not (S3_BUCKET_NAME and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
-        raise RuntimeError("Missing one or more S3 env vars (S3_BUCKET_NAME, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)")
-    return boto3.client(
-        "s3",
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        region_name=AWS_REGION,
-    )
-
-# ----------------------------------
-# App & CORS
-# ----------------------------------
-RAW_ALLOWED = os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://tremolo-frontend-one.vercel.app,"
-    "http://localhost:3000,http://127.0.0.1:3000,"
-    "http://localhost:5173,http://127.0.0.1:5173"
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+    region_name=os.environ.get("AWS_REGION", "us-east-2")  # Specify your bucket's region
 )
-ALLOWED_ORIGINS = [o.strip() for o in RAW_ALLOWED.split(",") if o.strip()]
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME")
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
-)
-
-# ----------------------------------
-# Health
-# ----------------------------------
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "allowed_origins": ALLOWED_ORIGINS}
-
-@app.options("/api/upload-video")
-async def options_upload_video():
-    return JSONResponse(status_code=204, content=None)
-
-# ----------------------------------
-# In-memory job state
-# ----------------------------------
 JOB_STATUS_DB = {}
 
-# ----------------------------------
-# Vision / Modal (optional)
-# ----------------------------------
-VisionAgent = None
-
-@app.on_event("startup")
-def _maybe_init_modal():
-    global VisionAgent
-    if not modal:
-        print("[startup] modal not installed; vision will be disabled.")
-        return
-    try:
-        # Lazily resolve the class only if modal exists in this environment
-        VisionProcessor = modal.Cls.from_name("Tremolo-Vision", "VisionProcessor")
-        VisionAgent = VisionProcessor()
-        print("[startup] Modal VisionAgent initialized.")
-    except Exception as e:
-        print(f"[startup] Modal unavailable: {e}. Vision will be disabled.")
-        VisionAgent = None
-
-# ----------------------------------
-# Helpers
-# ----------------------------------
 def upload_to_public_storage(file_path: str, job_id: str) -> str:
     """
     Uploads a file to S3 and makes it public-read.
-    Returns the public URL for the uploaded video.
+    Returns the public URL for Modal.
     """
-    s3_client = get_s3_client()
-    s3_key = f"uploads/{job_id}.mp4"
-
-    print(f"Uploading {file_path} to s3://{S3_BUCKET_NAME}/{s3_key} ...")
-    s3_client.upload_file(
-        file_path,
-        S3_BUCKET_NAME,
-        s3_key,
-        ExtraArgs={"ACL": "public-read", "ContentType": "video/mp4"},
-    )
-
-    region = s3_client.meta.region_name or "us-east-1"
-    # some buckets in us-east-1 omit the region in URL; this generic form works with explicit region:
-    return f"https://{S3_BUCKET_NAME}.s3.{region}.amazonaws.com/{s3_key}"
-
-# ----------------------------------
-# Endpoints
-# ----------------------------------
-@app.post("/api/upload-video")
-async def upload_video(file: UploadFile = File(...)):
-    """
-    Upload a video to S3.
-    If Modal vision is available, spawn a vision job.
-    In parallel, run STT and Prosody locally.
-    """
-    if file is None:
-        raise HTTPException(status_code=400, detail="Missing file. Send as multipart/form-data with field name 'file'.")
-    if file.content_type and not file.content_type.startswith(("video/", "application/octet-stream")):
-        raise HTTPException(status_code=415, detail=f"Unsupported content type: {file.content_type}")
-
-    os.makedirs("/tmp", exist_ok=True)
-    job_id = str(uuid.uuid4())
-    tmp_path = os.path.join("/tmp", f"{job_id}.mp4")
+    if not S3_BUCKET_NAME:
+        raise Exception("S3_BUCKET_NAME environment variable not set.")
+        
+    s3_key = f"uploads/{job_id}.mp4" # The "folder" and "filename" in S3
 
     try:
-        # Save upload to temp file
-        with open(tmp_path, "wb") as out:
-            shutil.copyfileobj(file.file, out)
-
-        # Upload to S3 first
-        public_video_url = upload_to_public_storage(tmp_path, job_id)
-
-        # If Modal is present, spawn vision; otherwise skip gracefully
-        modal_call_id = None
-        if VisionAgent:
+        print(f"Uploading {file_path} to S3 bucket {S3_BUCKET_NAME} as {s3_key}...")
+        s3_client.upload_file(
+            file_path,
+            S3_BUCKET_NAME,
+            s3_key,
+            ExtraArgs={
+                'ACL': 'public-read', # CRITICAL: This makes the file public
+                'ContentType': 'video/mp4'
+            }
+        )
+        
+        # Get the public URL with the correct region
+        region = s3_client.meta.region_name
+        if not region:
             try:
-                call = VisionAgent.analyze.spawn(public_video_url)
-                modal_call_id = getattr(call, "object_id", None)
-                print(f"[{job_id}] spawned Modal vision job: {modal_call_id}")
-            except Exception as e:
-                print(f"[{job_id}] Modal spawn failed (continuing without vision): {e}")
+                location = s3_client.get_bucket_location(Bucket=S3_BUCKET_NAME)
+                region = location['LocationConstraint'] or 'us-east-1'
+            except:
+                region = 'us-east-1'
+        
+        public_url = f"https://{S3_BUCKET_NAME}.s3.{region}.amazonaws.com/{s3_key}"
+        print(f"Upload complete. Public URL: {public_url}")
+        return public_url
 
-        # Run STT + Prosody in parallel
+    except Exception as e:
+        print(f"S3 upload failed: {e}")
+        raise
+    
+
+app = FastAPI()
+
+# --- App Configuration
+origins = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class JobStatus(BaseModel):
+    status: str
+    job_id: str
+    data: dict | None = None
+
+try:
+    VisionProcessor = modal.Cls.from_name("Tremolo-Vision", "VisionProcessor")
+    VisionAgent = VisionProcessor()
+except modal.exception.NotFoundError:
+    print("Error: Modal function not found. Did you deploy `modal_processor.py`?")
+    VisionAgent = None
+
+# --- API Endpoints ---
+
+@app.post("/api/upload-video", response_model=JobStatus)
+async def upload_video(file: UploadFile = File(...)):
+    """
+    This endpoint uploads a video to S3 and starts a Modal job to process it.
+    """
+    if not VisionAgent:
+        return JSONResponse(status_code=500, content={"status":"error", "detail":"Vision agent is not deployed."})
+
+    try:
+        job_id = str(uuid.uuid4())
+        
+        # 1. Save file locally (temporarily)
+        temp_dir = "/tmp"
+        os.makedirs(temp_dir, exist_ok=True)
+        video_path = os.path.join(temp_dir, f"{job_id}.mp4")
+
+        with open(video_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # 2. Upload the file to S3 FIRST so Modal can start
+        public_video_url = upload_to_public_storage(video_path, job_id)
+        
+        # 3. Start the Modal vision job ASYNCHRONOUSLY
+        print(f"Spawning Modal job for {job_id} with URL: {public_video_url}")
+        call = VisionAgent.analyze.spawn(public_video_url)
+        modal_call_id = call.object_id
+
+        # 4. Run STT and Prosody in parallel locally
+        print(f"Starting parallel processing (STT + Prosody) for {job_id}...")
         transcription_data = None
         prosody_data = None
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            stt_future = pool.submit(transcribe_video, public_video_url)
-            prosody_future = pool.submit(analyze_prosody, tmp_path)
-            for fut in as_completed([stt_future, prosody_future]):
+        
+        # Use ThreadPoolExecutor to run these IO-bound/CPU-bound tasks without blocking
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            stt_future = executor.submit(transcribe_video, public_video_url)
+            # We can run prosody on the local file since we still have it
+            prosody_future = executor.submit(analyze_prosody, video_path)
+            
+            for future in as_completed([stt_future, prosody_future]):
                 try:
-                    res = fut.result()
-                    if fut is stt_future:
-                        transcription_data = res
-                        print(f"[{job_id}] STT done")
-                    else:
-                        prosody_data = res
-                        print(f"[{job_id}] Prosody done")
-                except Exception as sub_e:
-                    print(f"[{job_id}] subtask failed: {sub_e}")
+                    if future == stt_future:
+                        transcription_data = future.result()
+                        print(f"Transcription completed for {job_id}")
+                    elif future == prosody_future:
+                        prosody_data = future.result()
+                        print(f"Prosody analysis completed for {job_id}")
+                except Exception as e:
+                    print(f"Subtask failed for {job_id}: {e}")
+                    # We'll handle errors by having None data, which enricher will have to handle
 
+        # 5. Clean up local file
+        os.remove(video_path)
+
+        # 6. Create job record
         JOB_STATUS_DB[job_id] = {
-            "status": "processing" if modal_call_id else "enriching",
-            "job_id": job_id,
-            "modal_id": modal_call_id,
+            "status": "processing", 
+            "modal_id": modal_call_id, 
             "transcription": transcription_data,
             "prosody": prosody_data,
             "vision": None,
-            "enriched_transcript": None,
+            "enriched_transcript": None # Placeholder for final result
         }
 
-        # If no modal vision, we can enrich immediately with what we have
-        if not modal_call_id:
-            try:
-                if transcription_data and transcription_data.get("status") == "completed":
-                    JOB_STATUS_DB[job_id]["enriched_transcript"] = enrich_transcript(
-                        transcription_data, None, prosody_data
-                    )
-                else:
-                    JOB_STATUS_DB[job_id]["enriched_transcript"] = {
-                        "error": "Transcription missing or incomplete; cannot enrich."
-                    }
-                JOB_STATUS_DB[job_id]["status"] = "complete"
-            except Exception as e:
-                print(f"[{job_id}] enrichment failed: {e}")
-
-        return JSONResponse(status_code=202, content={"status": JOB_STATUS_DB[job_id]["status"], "job_id": job_id})
-
+        return JSONResponse(status_code=202, content={"status": "processing", "job_id": job_id})
+        
     except Exception as e:
-        print(f"[{job_id}] upload failed: {e}")
+        print(f"Upload failed: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "job_id": None, "detail": str(e)})
 
-    finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception as cleanup_err:
-            print(f"[{job_id}] temp cleanup error: {cleanup_err}")
-
-@app.get("/api/status/{job_id}")
+@app.get("/api/status/{job_id}", response_model=JobStatus)
 async def get_job_status(job_id: str):
     job = JOB_STATUS_DB.get(job_id)
     if not job:
         return JSONResponse(status_code=404, content={"status": "error", "detail": "Job not found."})
+    
+    if job["status"] == "complete":
+        # Return the full job object, which is now clean
+        return JSONResponse(status_code=200, content=job)
 
-    # If already complete or no modal job, return as-is (with raw bits scrubbed)
-    if job["status"] == "complete" or not job.get("modal_id"):
-        safe = {k: v for k, v in job.items() if k not in ("prosody", "vision", "modal_id")}
-        return JSONResponse(status_code=200, content=safe)
-
-    # Poll Modal non-blocking
+    # Poll Modal
     try:
-        if not modal:
-            return JSONResponse(status_code=200, content={"status": job["status"], "job_id": job_id})
-
         modal_call = modal.FunctionCall.from_id(job["modal_id"])
         try:
-            vision_data = modal_call.get(timeout=0)  # immediate return if ready
-
+            vision_data = modal_call.get(timeout=0)
+            
+            # JOB COMPLETE! Time to enrich.
+            print(f"Job {job_id} completed! Running enrichment...")
             job["vision"] = vision_data
-            # Enrich if we have transcription
-            if job.get("transcription") and job["transcription"].get("status") == "completed":
-                job["enriched_transcript"] = enrich_transcript(
-                    job["transcription"], job["vision"], job.get("prosody")
-                )
+            
+            # --- THE ORCHESTRATION STEP ---
+            if job["transcription"] and job["transcription"].get("status") == "completed":
+                 job["enriched_transcript"] = enrich_transcript(
+                     job["transcription"],
+                     job["vision"],
+                     job["prosody"]
+                 )
             else:
-                job["enriched_transcript"] = {"error": "Transcription failed or incomplete; cannot enrich."}
+                job["enriched_transcript"] = {"error": "Transcription failed, cannot enrich."}
+            # -----------------------------
 
             job["status"] = "complete"
-            safe = {k: v for k, v in job.items() if k not in ("prosody", "vision", "modal_id")}
-            return JSONResponse(status_code=200, content=safe)
 
+            # --- CLEANUP ---
+            # Remove raw data now that it's in the enriched_transcript
+            # This cleans the in-memory DB entry and the response payload
+            if "prosody" in job:
+                del job["prosody"]
+            if "vision" in job:
+                del job["vision"]
+            if "modal_id" in job: # No longer needed by client
+                del job["modal_id"]
+            # ---------------
+
+            return JSONResponse(status_code=200, content=job)
+            
         except TimeoutError:
             return JSONResponse(status_code=200, content={"status": "processing", "job_id": job_id})
 
     except Exception as e:
-        print(f"[{job_id}] status check failed: {e}")
+        print(f"Status check failed: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
-# ----------------------------------
-# Entrypoint
-# ----------------------------------
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
