@@ -154,10 +154,8 @@ def enrich_transcript(transcript_data, vision_data, prosody_data):
             word_vision, word_prosody = slice_data_for_word(word, vision_data, prosody_data)
             
             # --- 2. ANALYSIS: Calculate raw metrics for this word ---
-            
             # Vision Metric: Gesture Intensity
             avg_velocity = calculate_wrist_velocity(word_vision)
-            
             # Prosody Metrics: Audio Intensity and Pitch
             avg_intensity, avg_pitch = calculate_prosody_metrics(word_prosody)
             
@@ -198,11 +196,16 @@ def enrich_transcript(transcript_data, vision_data, prosody_data):
     # --- 4. SENTENCE-LEVEL ANALYSIS ---
     sentence_analysis = analyze_sentence_patterns(enriched_words)
     
-    # --- 5. STRIP DOWN TO ESSENTIAL FIELDS ---
+    # --- 5. STRIP DOWN TO ESSENTIAL FIELDS (with timestamps restored) ---
     stripped_words = []
     for word in enriched_words:
         stripped_words.append({
             "text": word.get("text", ""),
+            "start": word.get("start"),
+            "end": word.get("end"),
+            # include formatted timestamps if they exist on the STT word
+            "start_formatted": word.get("start_formatted"),
+            "end_formatted": word.get("end_formatted"),
             "tags": word.get("tags", []),
             "confidence_score": word.get("confidence_score", 50)
         })
@@ -232,7 +235,10 @@ def format_enriched_output(transcript_data, vision_data, prosody_data):
     def calculate_coverage(data, duration):
         if duration == 0 or not data:
             return 0.0
-        covered_time = len(data) * (data[1].get("timestamp", 0) - data[0].get("timestamp", 0)) if len(data) > 1 else 0
+        covered_time = (
+            len(data) * (data[1].get("timestamp", 0) - data[0].get("timestamp", 0))
+            if len(data) > 1 else 0
+        )
         return min(100.0, (covered_time / duration) * 100)
     
     total_duration = words[-1]["end"] if (words := transcript_data.get("words", [])) else 0
