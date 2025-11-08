@@ -70,11 +70,13 @@ class VisionProcessor:
         # We need to save it to a temporary local file for OpenCV
         temp_video_path = "/tmp/input_video.mp4"
         try:
-            with httpx.stream("GET", video_url, timeout=30.0, follow_redirects=True) as response:
-                response.raise_for_status()  # Check for download errors
+            # Use httpx.Client to properly handle redirects
+            with httpx.Client(follow_redirects=True, timeout=60.0) as client:
+                response = client.get(video_url)
+                response.raise_for_status()  # Now check after redirects are followed
+                
                 with open(temp_video_path, "wb") as f:
-                    for chunk in response.iter_bytes():
-                        f.write(chunk)
+                    f.write(response.content)
             print(f"Video downloaded from {video_url}")
         except Exception as e:
             print(f"Error downloading video: {e}")
