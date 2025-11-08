@@ -1,8 +1,10 @@
 fastapi
 uvicorn[standard]  # Adds high-performance extras
-modal-client       # To connect to and call Modal
+modal               # To connect to and call Modal
 boto3              # AWS SDK for S3 uploads
 httpx              # For downloading the video inside Modal
+multipart
+dotenv
 
 numpy==1.26.4
 opencv-python-headless==4.8.0.76
