@@ -6,6 +6,7 @@ httpx              # For downloading the video inside Modal
 multipart
 dotenv
 assemblyai
+librosa
 
 numpy==1.26.4
 opencv-python-headless==4.8.0.76
