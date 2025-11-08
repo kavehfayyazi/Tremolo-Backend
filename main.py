@@ -5,11 +5,24 @@ import os
 import json
 import modal # Import Modal
 from fastapi import FastAPI, UploadFile, File, Request
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import boto3
 from dotenv import load_dotenv
+from ai import generate_feedback, FeedbackList
+
+# Optional deps
+try:
+    import modal  # optional; may not exist in Railway image
+except Exception:
+    modal = None
+
+# Your local modules
 from STT import transcribe_video
 from prosody_processor import analyze_prosody
 # Import the new enricher
@@ -199,6 +212,8 @@ async def get_job_status(job_id: str):
             # -----------------------------
 
             job["status"] = "complete"
+            safe = {k: v for k, v in job.items() if k not in ("prosody", "vision", "modal_id", "job_id")}
+            return JSONResponse(status_code=200, content=safe)
 
             # --- CLEANUP ---
             # Remove raw data now that it's in the enriched_transcript
@@ -220,5 +235,45 @@ async def get_job_status(job_id: str):
         print(f"Status check failed: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
+@app.post("/api/ai", response_model=FeedbackList)
+async def generate_ai_feedback(request: Request):
+    """
+    This endpoint accepts enriched transcript data and returns AI-generated feedback.
+    
+    Expected input format:
+    {
+        "enriched_transcript": {
+            "words": [
+                {
+                    "text": "word",
+                    "start": 0.0,
+                    "end": 0.5,
+                    "tags": [...],
+                    "confidence_score": 85
+                },
+                ...
+            ]
+        }
+    }
+    """
+    try:
+        # Parse the request body
+        data = await request.json()
+        
+        # Generate feedback using the AI function
+        feedback = generate_feedback(data)
+        
+        return feedback
+        
+    except Exception as e:
+        print(f"AI feedback generation failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "detail": str(e)}
+        )
+
+# ----------------------------------
+# Entrypoint
+# ----------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
