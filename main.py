@@ -2,6 +2,7 @@ import uvicorn
 import shutil
 import uuid
 import os
+import json
 import modal # Import Modal
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import JSONResponse
@@ -11,6 +12,8 @@ import boto3
 from dotenv import load_dotenv
 from STT import transcribe_video
 from prosody_processor import analyze_prosody
+# Import the new enricher
+from enricher import enrich_transcript
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load environment variables from .env file
@@ -49,20 +52,15 @@ def upload_to_public_storage(file_path: str, job_id: str) -> str:
         )
         
         # Get the public URL with the correct region
-        # Use virtual-hosted-style URL (bucket-name.s3.region.amazonaws.com)
         region = s3_client.meta.region_name
-        print(f"Region: {region}")
         if not region:
-            # If region is not set, try to get it from the bucket location
             try:
                 location = s3_client.get_bucket_location(Bucket=S3_BUCKET_NAME)
                 region = location['LocationConstraint'] or 'us-east-1'
             except:
                 region = 'us-east-1'
         
-        # Virtual-hosted-style URL format
         public_url = f"https://{S3_BUCKET_NAME}.s3.{region}.amazonaws.com/{s3_key}"
-        
         print(f"Upload complete. Public URL: {public_url}")
         return public_url
 
@@ -119,25 +117,25 @@ async def upload_video(file: UploadFile = File(...)):
         with open(video_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        # 2. Upload the file to S3
+        # 2. Upload the file to S3 FIRST so Modal can start
         public_video_url = upload_to_public_storage(video_path, job_id)
         
-        # 3. Start the Modal vision job ASYNCHRONOUSLY (runs in parallel)
+        # 3. Start the Modal vision job ASYNCHRONOUSLY
         print(f"Spawning Modal job for {job_id} with URL: {public_video_url}")
         call = VisionAgent.analyze.spawn(public_video_url)
         modal_call_id = call.object_id
 
-        # 4. Run STT and Prosody in parallel using ThreadPoolExecutor
+        # 4. Run STT and Prosody in parallel locally
         print(f"Starting parallel processing (STT + Prosody) for {job_id}...")
         transcription_data = None
         prosody_data = None
         
+        # Use ThreadPoolExecutor to run these IO-bound/CPU-bound tasks without blocking
         with ThreadPoolExecutor(max_workers=2) as executor:
-            # Submit both tasks
             stt_future = executor.submit(transcribe_video, public_video_url)
+            # We can run prosody on the local file since we still have it
             prosody_future = executor.submit(analyze_prosody, video_path)
             
-            # Wait for both to complete
             for future in as_completed([stt_future, prosody_future]):
                 try:
                     if future == stt_future:
@@ -147,111 +145,80 @@ async def upload_video(file: UploadFile = File(...)):
                         prosody_data = future.result()
                         print(f"Prosody analysis completed for {job_id}")
                 except Exception as e:
-                    if future == stt_future:
-                        print(f"Transcription failed for {job_id}: {e}")
-                        transcription_data = {
-                            "status": "error",
-                            "error": str(e),
-                            "full_text": None,
-                            "words": []
-                        }
-                    elif future == prosody_future:
-                        print(f"Prosody analysis failed for {job_id}: {e}")
-                        prosody_data = {
-                            "status": "error",
-                            "error": str(e),
-                            "data": []
-                        }
-        
-        # 5. Clean up the local temp file (after prosody is done)
+                    print(f"Subtask failed for {job_id}: {e}")
+                    # We'll handle errors by having None data, which enricher will have to handle
+
+        # 5. Clean up local file
         os.remove(video_path)
 
-        # 6. Create the job in our mock DB (mapping our ID to Modal's ID)
+        # 6. Create job record
         JOB_STATUS_DB[job_id] = {
             "status": "processing", 
             "modal_id": modal_call_id, 
-            "data": None,
             "transcription": transcription_data,
-            "prosody": prosody_data
+            "prosody": prosody_data,
+            "vision": None,
+            "enriched_transcript": None # Placeholder for final result
         }
 
-        # 7. Return IMMEDIATELY to the client
-        return JSONResponse(
-            status_code=202,
-            content={"status": "processing", "job_id": job_id}
-        )
+        return JSONResponse(status_code=202, content={"status": "processing", "job_id": job_id})
         
     except Exception as e:
         print(f"Upload failed: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "job_id": None, "detail": str(e)}
-        )
+        return JSONResponse(status_code=500, content={"status": "error", "job_id": None, "detail": str(e)})
 
 @app.get("/api/status/{job_id}", response_model=JobStatus)
 async def get_job_status(job_id: str):
-    """
-    This endpoint now actively polls Modal for the job status.
-    """
-    
-    # 1. Check our DB for the job
     job = JOB_STATUS_DB.get(job_id)
-
     if not job:
-        return JSONResponse(
-            status_code=404,
-            content={"status": "error", "job_id": job_id, "detail": "Job not found."}
-        )
+        return JSONResponse(status_code=404, content={"status": "error", "detail": "Job not found."})
     
-    # 2. If it's already complete, just return the data (including transcription and prosody)
     if job["status"] == "complete":
-        return JSONResponse(status_code=200, content={
-            "status": job["status"],
-            "job_id": job_id,
-            "data": job.get("data"),
-            "transcription": job.get("transcription"),
-            "prosody": job.get("prosody")
-        })
+        # Return the full job object, which is now clean
+        return JSONResponse(status_code=200, content=job)
 
-    # 3. If still processing, let's check Modal
+    # Poll Modal
     try:
-        modal_call_id = job["modal_id"]
-        modal_call = modal.FunctionCall.from_id(modal_call_id)
-        
-        # Try to get the result with timeout=0 (poll immediately)
+        modal_call = modal.FunctionCall.from_id(job["modal_id"])
         try:
-            print(f"Polling Modal for job {job_id}...")
             vision_data = modal_call.get(timeout=0)
             
-            # If we get here, the job is complete!
-            print(f"Job {job_id} completed successfully!")
+            # JOB COMPLETE! Time to enrich.
+            print(f"Job {job_id} completed! Running enrichment...")
+            job["vision"] = vision_data
+            
+            # --- THE ORCHESTRATION STEP ---
+            if job["transcription"] and job["transcription"].get("status") == "completed":
+                 job["enriched_transcript"] = enrich_transcript(
+                     job["transcription"],
+                     job["vision"],
+                     job["prosody"]
+                 )
+            else:
+                job["enriched_transcript"] = {"error": "Transcription failed, cannot enrich."}
+            # -----------------------------
+
             job["status"] = "complete"
-            job["data"] = vision_data
-            return JSONResponse(status_code=200, content={
-                "status": "complete",
-                "job_id": job_id,
-                "data": vision_data,
-                "transcription": job.get("transcription"),
-                "prosody": job.get("prosody")
-            })
+
+            # --- CLEANUP ---
+            # Remove raw data now that it's in the enriched_transcript
+            # This cleans the in-memory DB entry and the response payload
+            if "prosody" in job:
+                del job["prosody"]
+            if "vision" in job:
+                del job["vision"]
+            if "modal_id" in job: # No longer needed by client
+                del job["modal_id"]
+            # ---------------
+
+            return JSONResponse(status_code=200, content=job)
             
         except TimeoutError:
-            # Job is still running
-            print(f"Job {job_id} is still running on Modal.")
             return JSONResponse(status_code=200, content={"status": "processing", "job_id": job_id})
 
-    except modal.exception.NotFoundError:
-         return JSONResponse(status_code=404, content={"status": "error", "job_id": job_id, "detail": "Modal call ID not found."})
     except Exception as e:
-        # This can happen if the Modal job failed
-        print(f"Modal job {job_id} failed: {e}")
-        error_detail = str(e)
-            
-        job["status"] = "error"
-        job["data"] = {"detail": error_detail}
-        return JSONResponse(status_code=200, content=job) # Return 200 so client can parse it
+        print(f"Status check failed: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
-# --- Run the Server ---
 if __name__ == "__main__":
-    print("Starting FastAPI server on http://localhost:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
